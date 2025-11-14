@@ -482,6 +482,8 @@ ggplot(simulation_surface_data, aes(x = y_aim, y = z_aim)) +
   theme_test() +
   coord_fixed(ratio = 1)
 if (save_figs) {
+  # save as png (just for repo)
+  #ggsave("figures/prob_surface.png", width = 8, height = 6)
   dev.copy2pdf(file = "figures/binary_model_aim_heatmap.pdf", width = 8, height = 6)
 }
 ```
