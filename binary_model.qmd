@@ -1,0 +1,510 @@
+---
+title: "SDS 6540 Final Project"
+author: "Benedikt Farag"
+date: "`r Sys.Date()`"
+format: 
+  html:
+    toc: true
+    toc-depth: 5
+    number-sections: true
+    toc-expand: true    # replaces "toc_float"
+    self-contained: true
+  pdf:
+    documentclass: article
+    geometry: margin=1in
+urlcolor: magenta
+---
+<!-- Render: system("quarto render dp7.qmd --to pdf") -->
+
+```{r}
+library(dplyr)
+library(brms)
+library(ggplot2)
+library(plotly)
+mvrnorm <- MASS::mvrnorm
+
+save_figs <- FALSE  # set to TRUE to save figures
+# make figures directory to save figures
+if (save_figs & !dir.exists("figures")) {
+  dir.create("figures")
+}
+
+# make models directory to save models
+if (!dir.exists("models")) {
+  dir.create("models")
+}
+
+rpost <- 3.66     # left post x coordinate (m)
+lpost <- -rpost   # right post x coordinate (m)
+bar <- 2.44       # goal height (m)
+delta = 0.12      # post thickness
+Y_POINTS <- 100   # number of points along y axis
+Z_POINTS <- 100   # number of points along z axis
+```
+
+# Load data
+
+```{r}
+data <- read.csv("data/penalties_scraped_corrected.csv")
+
+# remove rows with outcome as 'Wayward' (invalid penalties)
+data <- data %>%
+  filter(outcome != "Wayward")
+```
+
+```{r}
+# plot the data
+ggplot(data, aes(x = y_end, y = z_end, color = outcome)) +
+  geom_point(alpha = 0.9, size=1) +
+  geom_rect(
+    xmin = lpost, xmax = rpost, ymin = 0, ymax = bar,
+    fill = NA, color = "black", size = 0.3
+  ) +
+  geom_rect(
+    xmin = lpost - delta, xmax = rpost + delta, ymin = 0, ymax = bar + delta,
+    fill = NA, color = "black", size = 0.3
+  ) +
+  geom_segment(
+    x = -5, y = 0, xend = 5, yend = 0,
+    color = "black", size = 0.3
+  ) +
+  theme_test() +
+  coord_fixed(ratio = 1) +
+  theme(
+    legend.position = "top", legend.title = element_blank()
+  )
+```
+
+```{r}
+# prepare data for binary goal model
+
+# lets make a binary outcome: 1: goal, 0: saved
+# this also removes "Off T" and "Post" outcomes
+model_data <- data %>%
+  mutate(outcome_simple = case_when(
+    outcome == "Goal" ~ "Goal",
+    #outcome %in% c("Off T", "Post") ~ "Off T",
+    outcome %in% c("Saved", "Saved to Post") ~ "Saved"
+  )) %>%
+  mutate(is_goal = ifelse(outcome_simple == "Goal", 1, 0)) %>%
+  select(
+    is_goal, y_end, z_end, goalkeeper, taker
+  ) %>%
+  na.omit()
+
+# make categorical variables factors
+model_data$taker <- as.factor(model_data$taker)
+model_data$goalkeeper <- as.factor(model_data$goalkeeper)
+```
+
+```{r}
+# Fit the Bayesian GAM
+model_fit <- brm( 
+  is_goal ~ t2(y_end, z_end) + (1 | goalkeeper) + (1 | taker),
+  data = model_data,
+  family = bernoulli(), # usign default link = "logit" (logistic regression)
+  chains = 4,      # Number of Markov Chains
+  iter = 2000,     # Total iterations per chain
+  warmup = 1000,   # Burn-in iterations
+  seed = 2025,
+  file = "models/binary_model.rds" 
+)
+
+# print stan model
+#stancode(model_fit)
+```
+
+```{r}
+# make prediction grid
+goal_grid <- expand.grid(
+  y_end = seq(lpost, rpost, length.out = Y_POINTS), 
+  z_end = seq(0, bar, length.out = Z_POINTS) 
+)
+# can add goalkeeper and taker effects to this (specific players)
+
+# compute the posterior predictions over the grid
+posterior <- fitted(
+  model_fit, 
+  newdata = goal_grid,
+  re_formula = NA       # marginalize over random effects
+)
+
+# combine posterior with the grid
+surface_data <- as.data.frame(posterior) %>%
+  bind_cols(goal_grid)
+
+head(surface_data)
+```
+
+# Goal Probability Surface Plots
+
+```{r}
+# Plot the 2D heatmap for P(Goal)
+ggplot(surface_data, aes(x = y_end, y = z_end)) +
+  geom_raster(aes(fill = Estimate)) + 
+  scale_fill_gradientn(
+    colours = c("blue", "cyan", "yellow", "red"),
+    name = "P(goal)",
+    limits = c(0, 1)
+  ) +  
+  # goal frame 
+  geom_rect( 
+    xmin = lpost, xmax = rpost, ymin = 0, ymax = bar, 
+    fill = "transparent", 
+    color = "black",
+    linetype = "solid",
+    size = 0.3
+  ) +
+  geom_rect(
+    xmin = lpost - delta, xmax = rpost + delta, ymin = 0, ymax = bar + delta, 
+    fill = "transparent", 
+    color = "black",
+    linetype = "solid",
+    size = 0.3
+  ) +
+  geom_segment(
+    x = -4, y = 0, xend = 4, yend = 0,
+    color = "black",
+    linetype = "solid",
+    size = 0.3
+  ) +
+  labs(
+    title = "Posterior for scoring a Goal",
+    x = "y",
+    y = "z"
+  ) +
+  scale_y_continuous(limits = c(0, bar + 2* delta), breaks = seq(0,bar+2*delta, by=0.5)) +
+  theme_test() +
+  coord_fixed(ratio = 1) 
+if (save_figs) {
+  ggsave("figures/binary_model_posterior.pdf", width = 8, height = 6)
+}
+```
+
+```{r}
+# reshape the Estimate vector into a matrix
+prob_matrix <- matrix(
+  surface_data$Estimate, 
+  nrow = Y_POINTS, 
+  ncol = Z_POINTS
+)
+
+# 3d plot of P(Goal)
+fig_3d <- plot_ly(
+  x = ~unique(goal_grid$y_end),
+  y = ~unique(goal_grid$z_end), 
+  z = ~t(prob_matrix), # transpose
+  type = "surface",
+  colorscale = "Viridis",
+  colorbar = list(title = "P(Goal)")
+) %>%
+  layout(
+    title = "Posterior P(Goal)",
+    scene = list(
+      xaxis = list(title = "Horizontal (y_end)"),
+      yaxis = list(title = "Vertical (z_end)"),
+      zaxis = list(title = "P(Goal)", range = c(0, 1))
+    )
+  ) %>%
+  # set axis limits
+  layout(
+    scene = list(
+      xaxis = list(range = c(lpost + delta, rpost - delta)),
+      yaxis = list(range = c(0, bar - delta)),
+      zaxis = list(range = c(0, 1))
+    )
+  )
+
+fig_3d
+```
+
+
+# Width of credible interval for P(Goal)
+
+```{r}
+# plot ggplot heatmap of CI width
+ggplot(surface_data, aes(x = y_end, y = z_end)) +
+  geom_raster(aes(fill = Q97.5 - Q2.5)) +
+  scale_fill_gradientn(
+    colours = c("blue", "cyan", "yellow", "red"),
+    name = "",
+    limits = c(0, 0.33)
+  ) +
+  geom_rect(
+    xmin = lpost, xmax = rpost, ymin = 0, ymax = bar,
+    fill = NA, color = "black", size = 0.3
+  ) +
+  geom_rect(
+    xmin = lpost - delta, xmax = rpost + delta, ymin = 0, ymax = bar + delta,
+    fill = NA, color = "black", size = 0.3
+  ) +
+  geom_segment(
+    x = -4, y = 0, xend = 4, yend = 0,
+    color = "black", size = 0.3
+  ) +
+  labs(
+    title = "Width of 95% CI for P(goal)",
+    x = "y",
+    y = "z"
+  ) +
+  theme_test() +
+  scale_y_continuous(limits = c(0, bar + 2* delta), breaks = seq(0,bar+2*delta, by=0.5)) +
+  coord_fixed(ratio = 1)
+if (save_figs) {
+  ggsave("figures/binary_model_ci_width.pdf", width = 8, height = 6)
+}
+```
+
+```{r}
+# 3d plot of CI width
+
+# Reshape the CI vectors into matrices
+q2_5_matrix <- matrix(
+  surface_data$Q2.5,
+  nrow = Y_POINTS, 
+  ncol = Z_POINTS
+)
+
+q97_5_matrix <- matrix(
+  surface_data$Q97.5,
+  nrow = Y_POINTS, 
+  ncol = Z_POINTS
+)
+
+# width of credible interval
+diff <- q97_5_matrix - q2_5_matrix
+
+# set greater than 0.35 to 0.35 for better visualization
+diff[diff > 0.5] <- 0.35
+
+# make a plotly
+fig_3d <- plot_ly(
+  x = ~unique(goal_grid$y_end),  
+  y = ~unique(goal_grid$z_end),   
+  z = ~t(diff), 
+  type = "surface",
+  colorscale = "Jet",
+  colorbar = list(title = "CI Width")
+) %>%
+  layout(
+    title = "Width of 95% Credible Interval for P(Goal)",
+    scene = list(
+      xaxis = list(title = "Horizontal Location (y_end)"),
+      yaxis = list(title = "Vertical Location (z_end)"),
+      zaxis = list(title = "P(Goal)")
+    )
+  ) %>%
+  # set axis limits
+  layout(
+    scene = list(
+      xaxis = list(range = c(lpost + delta, rpost - delta)),
+      yaxis = list(range = c(0, bar - delta)),
+      zaxis = list(range = c(0, 0.35))
+    )
+  )
+
+fig_3d
+```
+
+```{r}
+# probability of scoring on the left side
+left_side_prob <- surface_data %>%
+  filter(y_end < 0) %>%
+  summarise(mean_prob = mean(Estimate))
+left_side_prob
+
+# probability of scoring on the right side
+right_side_prob <- surface_data %>%
+  filter(y_end >= 0) %>%
+  summarise(mean_prob = mean(Estimate))
+right_side_prob
+
+```
+
+
+# Risk of shooting near the posts
+
+Lets do some sampling using a noise level for horizontal and vertical noise to see how risky it is to shoot near the posts.
+
+
+```{r}
+noise_data <- data %>%
+  group_by(taker) %>%
+  filter(n() >= 10) %>% 
+  mutate(
+    y_abs = abs(y_end), # abs horizontal location
+    mean_y_abs = mean(y_abs, na.rm = TRUE),
+    mean_z = mean(z_end, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+# calculate noise statistics per taker
+taker_noise_summary <- noise_data %>%
+  group_by(taker) %>%
+  summarise(
+    n_shots = n(),
+    sigma_y_abs = sd(y_abs, na.rm = TRUE),
+    sigma_z = sd(z_end, na.rm = TRUE),
+    rho_y_abs_z = cor(y_abs, z_end, use = "pairwise.complete.obs")
+  ) %>%
+  na.omit() # Remove any takers with NA values (e.g., if sd is 0)
+
+#print(head(taker_noise_summary))
+
+avg_sigma_y_abs <- mean(taker_noise_summary$sigma_y_abs)
+avg_sigma_z <- mean(taker_noise_summary$sigma_z)
+avg_rho <- mean(taker_noise_summary$rho_y_abs_z)
+
+avg_sigma_y_abs
+avg_sigma_z
+avg_rho
+```
+
+
+```{r}
+N_sims <- 2000 # Increase for a smoother plot, decrease for speed
+Y_POINTS <- 90   # number of points along y axis
+Z_POINTS <- 30   # number of points along z axis
+
+# Noise parameters (can set custom values or use averages from above)
+sigma_y_abs_val <- 0.2
+sigma_z_val     <- 0.2
+rho_val         <- 0.1
+
+# covariance matrix: used for simulating shot locations
+cov_matrix_abs <- matrix(
+  c(sigma_y_abs_val^2, rho_val * sigma_y_abs_val * sigma_z_val,
+    rho_val * sigma_y_abs_val * sigma_z_val, sigma_z_val^2),
+  nrow = 2
+)
+
+# grid for aim points (assuming takers aim on the goal!)
+goal_grid_aim <- expand.grid(
+  y_aim = seq(lpost, rpost, length.out = Y_POINTS), 
+  z_aim = seq(0, bar, length.out = Z_POINTS) 
+)
+
+# the binary model
+model_goal_prob <- readRDS("models/binary_model.rds")
+
+# simulation loop
+print(paste("Starting simulation for", nrow(goal_grid_aim), "aim points..."))
+
+# Store results
+sim_results <- matrix(NA, nrow = nrow(goal_grid_aim), ncol = 3)
+colnames(sim_results) <- c("P_Goal", "P_Saved", "P_OffT")
+
+for (i in 1:nrow(goal_grid_aim)) {
+  
+  if (i %% 100 == 0) { # Print progress
+    print(paste("Running aim point", i, "of", nrow(goal_grid_aim)))
+  }
+  
+  aim_point_y <- goal_grid_aim$y_aim[i]
+  aim_point_z <- goal_grid_aim$z_aim[i]
+  
+  # We simulate using the *absolute* horizontal aim point
+  sim_mean <- c(abs(aim_point_y), aim_point_z)
+  
+  # Step A: Simulate N_sims "absolute" shot locations
+  sim_shots_abs <- mvrnorm(n = N_sims, mu = sim_mean, Sigma = cov_matrix_abs)
+  
+  # Unfold the y-locations back to the correct side
+  aim_side_sign <- ifelse(aim_point_y < 0, -1, 1)
+  
+  sim_shots_df <- data.frame(
+    y_end = sim_shots_abs[, 1] * aim_side_sign,
+    z_end = sim_shots_abs[, 2]
+  )
+  
+  # classify outcomes
+  outcomes <- rep(NA, N_sims)
+  
+  # Off target: can not go under the goal
+  is_off_t <- (sim_shots_df$y_end < lpost) | (sim_shots_df$y_end > rpost) |  
+              (sim_shots_df$z_end > bar)
+  
+  outcomes[is_off_t] <- "Off T"
+  
+  # Classify "On Target" shots
+  on_target_shots <- sim_shots_df[!is_off_t, ]
+  
+  if (nrow(on_target_shots) > 0) {
+    p_goal <- fitted(
+      model_goal_prob, 
+      newdata = on_target_shots,
+      re_formula = NA
+    )[, "Estimate"]
+    
+    is_goal <- rbinom(n = length(p_goal), size = 1, prob = p_goal)
+    on_target_outcomes <- ifelse(is_goal == 1, "Goal", "Saved")
+    outcomes[!is_off_t] <- on_target_outcomes
+  }
+  
+  # Calculate probabilities
+  sim_results[i, "P_Goal"] <- sum(outcomes == "Goal", na.rm = TRUE) / N_sims
+  sim_results[i, "P_Saved"] <- sum(outcomes == "Saved", na.rm = TRUE) / N_sims
+  sim_results[i, "P_OffT"] <- sum(outcomes == "Off T", na.rm = TRUE) / N_sims
+}
+
+print("Simulation complete.")
+
+# get the surface data
+simulation_surface_data <- bind_cols(goal_grid_aim, as.data.frame(sim_results))
+```
+
+# Plot the risk surfaces
+
+```{r}
+ggplot(simulation_surface_data, aes(x = y_aim, y = z_aim)) +
+  geom_raster(aes(fill = P_Goal)) + 
+  scale_fill_gradientn(
+    colours = c("blue", "cyan", "yellow", "red"),
+    name = "P(Goal | Aim)",
+    limits = c(0, 1)
+  ) +
+  geom_rect(
+    xmin = lpost, xmax = rpost, ymin = 0, ymax = bar,
+    fill = NA, color = "black", linewidth = 0.3) +
+  geom_rect(
+    xmin = lpost - delta, xmax = rpost + delta, ymin = 0, ymax = bar + delta,
+    fill = NA, color = "black", linewidth = 0.3) +
+  geom_segment(
+    x = -4, y = 0, xend = 4, yend = 0,
+    color = "black", linewidth = 0.3) +
+  scale_y_continuous(limits = c(0, bar + 2* delta), breaks = seq(0,bar+2*delta, by=0.5)) +
+  labs(
+    title = "Probability of scoring a Goal given Aim Point",
+    #subtitle = "Accounts for save probability and risk of missing",
+    x = "y_aim (m)",
+    y = "z_aim (m)"
+  ) +
+  theme_test() +
+  coord_fixed(ratio = 1)
+if (save_figs) {
+  dev.copy2pdf(file = "figures/binary_model_aim_heatmap.pdf", width = 8, height = 6)
+}
+```
+
+```{r}
+# P(Off Target)
+ggplot(simulation_surface_data, aes(x = y_aim, y = z_aim)) +
+  geom_raster(aes(fill = P_OffT)) + 
+  scale_fill_gradientn(
+    colours = c("lightblue", "yellow", "red"),
+    name = "P(OffT | Aim)",
+    limits = c(0, NA)
+  ) +
+  geom_rect(
+    xmin = lpost, xmax = rpost, ymin = 0, ymax = bar,
+    fill = NA, color = "black", size = 0.3
+  ) +
+  labs(
+    title = "Probability of Shooting Off Target given Aim Point",
+    x = "Horizontal Aim Point (y)",
+    y = "Vertical Aim Point (z)"
+  ) +
+  theme_test() +
+  coord_fixed(ratio = 1)
+```
+

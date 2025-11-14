@@ -1,0 +1,289 @@
+---
+title: "SDS 6540 Final Project"
+author: "Benedikt Farag"
+date: "`r Sys.Date()`"
+format: 
+  html:
+    toc: true
+    toc-depth: 5
+    number-sections: true
+    toc-expand: true    # replaces "toc_float"
+    self-contained: true
+  pdf:
+    documentclass: article
+    geometry: margin=1in
+urlcolor: magenta
+---
+<!-- Render: system("quarto render multinomial_model.qmd --to pdf") -->
+
+```{r}
+library(dplyr)
+library(brms)
+library(ggplot2)
+library(plotly)
+library(tibble)
+
+#library(MASS) # for mvrnorm
+mvrnorm <- MASS::mvrnorm
+
+save_figs = FALSE
+# make models directory to save models
+if (!dir.exists("models")) {
+  dir.create("models")
+}
+```
+
+# Load data
+
+```{r}
+data <- read.csv("data/penalties_scraped_corrected.csv")
+
+# remove rows with outcome as 'Wayward' (invalid penalties)
+data <- data %>%
+  filter(outcome != "Wayward")
+
+rpost <- 3.66 # 4
+lpost <- -rpost
+bar <- 2.44       # 2.65
+delta = 0.12      # post thickness
+Y_POINTS <- 30   # number of points along y axis
+Z_POINTS <- 30   # number of points along z axis
+```
+
+
+```{r}
+ggplot(data, aes(x = y_end, y = z_end, color = outcome)) +
+  geom_point(alpha = 0.9, size=1) +
+  #scale_color_brewer(palette = "Set2") +
+  geom_rect(
+    xmin = lpost, xmax = rpost, ymin = 0, ymax = bar,
+    fill = NA, color = "black", linewidth = 0.3
+  ) +
+  geom_rect(
+    xmin = lpost - delta, xmax = rpost + delta, ymin = 0, ymax = bar + delta,
+    fill = NA, color = "black", linewidth = 0.3
+  ) +
+  geom_segment(
+    x = -5, y = 0, xend = 5, yend = 0,
+    color = "black", linewidth = 0.3
+  ) +
+  theme_test() +
+  coord_fixed(ratio = 1) +
+  theme(
+    legend.position = "top", legend.title = element_blank()
+  )
+if (save_figs){
+    dev.copy2pdf(file = "figures/penalty_shot_locations.pdf")
+}
+
+```
+
+
+
+```{r}
+model_data <- data %>%
+  mutate(outcome_simple = case_when(
+    outcome == "Goal" ~ "Goal",
+    outcome %in% c("Off T", "Post") ~ "Off T",
+    outcome %in% c("Saved", "Saved to Post") ~ "Saved"
+  )) %>%
+  filter(
+    !is.na(outcome_simple),
+    !is.na(y_end), !is.na(z_end), !is.na(minute), !is.na(gender),
+    !is.na(goalkeeper), !is.na(taker)
+  ) %>%
+  dplyr::select(
+    outcome_simple, y_end, z_end, minute, gender, goalkeeper, taker
+  )
+
+# Convert all categorical predictors to factors
+model_data$outcome_simple <- as.factor(model_data$outcome_simple)
+model_data$gender <- as.factor(model_data$gender)
+model_data$goalkeeper <- as.factor(model_data$goalkeeper)
+model_data$taker <- as.factor(model_data$taker)
+```
+
+
+```{r}
+# lets look at the noise in shot placement for each taker
+
+noise_data <- model_data %>%
+    mutate(y_end_abs = abs(y_end))
+
+# lets estimate the taker-specific noise in shot placement
+noise_model <- brm(
+  mvbind(y_end_abs, z_end) ~ 1 + (1 | taker),
+  data = noise_data,
+  family = student(), 
+  chains = 4,
+  iter = 2000,
+  file = "models/noise_model.rds" # Save the model
+)
+
+# look at stan model
+#stancode(noise_model)
+
+summary(noise_model)
+```
+
+
+
+```{r}
+# filter the shots on goal
+on_target_data <- model_data %>%
+  filter(outcome_simple %in% c("Goal", "Saved")) %>%
+  mutate(is_goal = ifelse(outcome_simple == "Goal", 1, 0))
+
+# model for goal probability
+model_save_prob <- brm(
+  is_goal ~ t2(y_end, z_end) + (1 | goalkeeper) + (1 | taker),
+  data = on_target_data,
+  family = bernoulli(link = "logit"),
+  chains = 4,
+  iter = 2000,
+  file = "models/model_goal_prob.rds" # Save the model
+)
+
+#stancode(model_save_prob)
+```
+
+
+
+```{r}
+N_sims <- 2000 # number of simulated shots per aim point
+
+# noise parameters from the noise model summary above
+sigma_y_abs_val <- 0.74
+sigma_z_val     <- 0.63
+rho_val         <- -0.16 
+
+# covariance matrix for the bivariate normal distribution
+cov_matrix_abs <- matrix(
+  c(sigma_y_abs_val^2, rho_val * sigma_y_abs_val * sigma_z_val,
+    rho_val * sigma_y_abs_val * sigma_z_val, sigma_z_val^2),
+  nrow = 2
+)
+
+# grid of aim points
+goal_grid_aim <- expand.grid(
+  y_aim = seq(lpost, rpost, length.out = Y_POINTS), 
+  z_aim = seq(0, bar, length.out = Z_POINTS) 
+)
+
+# load the trained goal probability model
+model_goal_prob <- readRDS("models/model_goal_prob.rds")
+
+# simulation loop
+print(paste("Starting simulation for", nrow(goal_grid_aim), "aim points..."))
+
+# matrix to store simulation results
+sim_results <- matrix(NA, nrow = nrow(goal_grid_aim), ncol = 3)
+colnames(sim_results) <- c("P_Goal", "P_Saved", "P_OffT")
+
+for (i in 1:nrow(goal_grid_aim)) {
+  
+  if (i %% 500 == 0) { # Print progress
+    print(paste("Running aim point", i, "of", nrow(goal_grid_aim)))
+  }
+  
+  aim_point_y <- goal_grid_aim$y_aim[i]
+  aim_point_z <- goal_grid_aim$z_aim[i]
+  
+  # We simulate using the *absolute* horizontal aim point
+  sim_mean <- c(abs(aim_point_y), aim_point_z)
+  
+  # Step A: Simulate N_sims "absolute" shot locations
+  sim_shots_abs <- mvrnorm(n = N_sims, mu = sim_mean, Sigma = cov_matrix_abs)
+  
+  # Unfold the y-locations back to the correct side
+  aim_side_sign <- ifelse(aim_point_y < 0, -1, 1)
+  
+  sim_shots_df <- data.frame(
+    y_end = sim_shots_abs[, 1] * aim_side_sign,
+    z_end = sim_shots_abs[, 2]
+  )
+  
+  # Step B: Classify outcomes
+  outcomes <- rep(NA, N_sims)
+  
+  # Classify Off Target shots 
+  is_off_t <- (sim_shots_df$y_end < lpost) | (sim_shots_df$y_end > rpost) |  
+              (sim_shots_df$z_end > bar)
+  
+  outcomes[is_off_t] <- "Off T"
+  
+  # On-target shots
+  on_target_shots <- sim_shots_df[!is_off_t, ]
+  
+  if (nrow(on_target_shots) > 0) {
+    p_goal <- fitted(
+      model_goal_prob, 
+      newdata = on_target_shots,
+      re_formula = NA
+    )[, "Estimate"]
+    
+    is_goal <- rbinom(n = length(p_goal), size = 1, prob = p_goal)
+    on_target_outcomes <- ifelse(is_goal == 1, "Goal", "Saved")
+    outcomes[!is_off_t] <- on_target_outcomes
+  }
+  
+  # calculate probabilities
+  sim_results[i, "P_Goal"] <- sum(outcomes == "Goal", na.rm = TRUE) / N_sims
+  sim_results[i, "P_Saved"] <- sum(outcomes == "Saved", na.rm = TRUE) / N_sims
+  sim_results[i, "P_OffT"] <- sum(outcomes == "Off T", na.rm = TRUE) / N_sims
+}
+
+print("Simulation complete.")
+
+# aggregate results
+simulation_surface_data <- bind_cols(goal_grid_aim, as.data.frame(sim_results))
+
+```
+
+
+```{r}
+# plot the simulation results
+
+ggplot(simulation_surface_data, aes(x = y_aim, y = z_aim)) +
+  geom_raster(aes(fill = P_Goal)) + 
+  scale_fill_gradientn(
+    colours = c("blue", "cyan", "yellow", "red"),
+    name = "P(Goal | Aim)",
+    limits = c(0, NA)
+  ) +
+  geom_rect(
+    xmin = lpost, xmax = rpost, ymin = 0, ymax = bar,
+    fill = NA, color = "black", size = 0.3
+  ) +
+  labs(
+    title = "P(goal) given aim point",
+    subtitle = "Accounts for save probability and risk of missing",
+    x = "Horizontal Aim Point (y)",
+    y = "Vertical Aim Point (z)"
+  ) +
+  theme_test() +
+  coord_fixed(ratio = 1)
+```
+
+
+```{r}
+# P(Off Target)
+ggplot(simulation_surface_data, aes(x = y_aim, y = z_aim)) +
+  geom_raster(aes(fill = P_OffT)) + 
+  scale_fill_gradientn(
+    colours = c("lightblue", "yellow", "red"),
+    name = "P(OffT | Aim)",
+    limits = c(0, NA)
+  ) +
+  geom_rect(
+    xmin = lpost, xmax = rpost, ymin = 0, ymax = bar,
+    fill = NA, color = "black", size = 0.3
+  ) +
+  labs(
+    title = "Probability of Shooting Off Target given Aim Point",
+    x = "Horizontal Aim Point (y)",
+    y = "Vertical Aim Point (z)"
+  ) +
+  theme_test() +
+  coord_fixed(ratio = 1)
+```
