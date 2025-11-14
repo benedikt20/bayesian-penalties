@@ -18,8 +18,8 @@ Bayesian modeling of soccer penalty shot locations
   
 ## Results
 Posterior distribution of scoring a goal given an aim point of the goal: $P(\text{Goal}|\text{Aim})$
-<p align="center">
-  <img src="figs/prob_surface.png" alt="Equation for goal probability" width="450">
-</p>
+<figure style="margin-top: -10px;" align="center">
+  <img src="figs/prob_surface.png" width="1000">
+</figure>
 
 
