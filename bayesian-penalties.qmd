@@ -1,0 +1,356 @@
+---
+title: "SDS 6540 Final Project"
+author: "Benedikt Farag"
+date: "`r Sys.Date()`"
+format: 
+  html:
+    toc: true
+    toc-depth: 5
+    number-sections: true
+    toc-expand: true    # replaces "toc_float"
+    self-contained: true
+  pdf:
+    documentclass: article
+    geometry: margin=1in
+urlcolor: magenta
+---
+
+```{r}
+library(dplyr)
+library(brms)
+library(ggplot2)
+dmvnorm <- mvtnorm::dmvnorm
+
+source("src/config.R")
+source("src/soccer_functions.R")
+```
+
+# Load data
+
+```{r}
+data <- read.csv("data/penalties_scraped_corrected.csv")
+
+# remove rows with outcome as 'Wayward' (invalid penalties)
+data <- data %>%
+  filter(outcome != "Wayward")
+```
+
+
+```{r}
+# plot the data
+ggplot(data, aes(x = y_end, y = z_end, color = outcome)) +
+  geom_point(alpha = 0.9, size=1) +
+  just_goalframe +
+  theme(legend.position = "top", legend.title = element_blank())
+if (save_figs) {
+  dev.copy2pdf(file="figures/penalty_scatterplot.pdf", width = 8, height = 5)
+}
+```
+
+Let's prepare the data for the binary goal model:
+- lets make a binary outcome: 1: goal, 0: saved
+- this also removes "Off T" and "Post" outcomes
+
+```{r}
+
+model_data <- data %>%
+  mutate(outcome_simple = case_when(
+    outcome == "Goal" ~ "Goal",
+    outcome %in% c("Saved", "Saved to Post") ~ "Saved"
+  )) %>%
+  mutate(is_goal = ifelse(outcome_simple == "Goal", 1, 0)) %>%
+  select(
+    is_goal, y_end, z_end, goalkeeper, taker
+  ) %>%
+  na.omit()
+
+# make categorical variables factors
+model_data$taker <- as.factor(model_data$taker)
+model_data$goalkeeper <- as.factor(model_data$goalkeeper)
+```
+
+Now we can fit the Bayesian GAM model for the binary goal outcome
+
+```{r}
+model_fit <- brm( 
+  is_goal ~ t2(y_end, z_end) + (1 | goalkeeper) + (1 | taker),
+  data = model_data,
+  family = bernoulli(), # usign default link = "logit" (logistic regression)
+  chains = 4,      # Number of Markov Chains
+  iter = 2000,     # Total iterations per chain
+  warmup = 1000,   
+  seed = myseed,
+  file = "models/binary_model.rds" 
+)
+
+# print stan model
+stancode(model_fit)
+```
+
+Then let's make a probability grid, with the fitted posterior probabilities over the goal area
+
+```{r}
+prob_grid <- make_prob_grid(model_fit)
+head(prob_grid)
+```
+
+# Goal Probability Surface Plots
+
+Let's plot the posterior estimate for P(Goal) over the goal area, from the binary model
+
+```{r}
+ggplot(prob_grid, aes(x = y_end, y = z_end)) +
+  geom_raster(aes(fill = Estimate)) + 
+  goalframe(title = "Posterior Probability P(goal | location) ")
+if (save_figs) {
+  dev.copy2pdf(file="figures/binary_model_posterior.pdf", width = 8, height = 3.5)
+}
+```
+
+
+# Width of credible interval for P(Goal)
+
+```{r}
+ggplot(prob_grid, aes(x = y_end, y = z_end)) +
+  geom_raster(aes(fill = Q97.5 - Q2.5)) +
+  goalframe(title = "Width of 95% CI for P(goal | location)", fill_limits = c(0, 0.33))
+if (save_figs) {
+  dev.copy2pdf(file="figures/binary_model_ci_width.pdf", width = 8, height = 3.5)
+}
+```
+
+Average probability of scoring on left vs right side, is that equal? And is that
+significantly different?
+
+```{r}
+side_probs <- prob_grid %>%
+  mutate(side = ifelse(y_end < 0, "Left", "Right")) %>%
+  group_by(side) %>%
+  summarise(mean_prob = mean(Estimate))
+
+side_probs
+
+# check the credible intervals
+post_samples <- fitted(model_fit, newdata = prob_grid, re_formula = NA, summary = FALSE)
+left_posterior_means <- rowMeans(post_samples[, which(prob_grid$y_end < 0)])
+right_posterior_means <- rowMeans(post_samples[, which(prob_grid$y_end > 0)])
+
+# difference (right - left) distribution
+diff_dist <- right_posterior_means - left_posterior_means
+
+mean_diff <- mean(diff_dist)
+ci_diff <- quantile(diff_dist, probs = c(0.025, 0.975))
+
+mean_diff
+ci_diff
+```
+
+====================================================
+# Player-precision model
+====================================================
+
+Let's prepare the data for the precision model:
+
+```{r}
+prepared_data <- data %>%
+  mutate(outcome_simple = case_when(
+    outcome == "Goal" ~ "Goal",
+    outcome %in% c("Off T", "Post") ~ "Off T",
+    outcome %in% c("Saved", "Saved to Post") ~ "Saved"
+  )) %>%
+  rename(y = y_end, z = z_end) %>%
+  mutate(y_abs = abs(y)) %>%
+  select(
+    y_abs, y, z, taker
+  ) %>%
+  na.omit()
+
+# make taker categorical
+prepared_data$taker <- as.factor(prepared_data$taker)
+```
+
+Lets filter players with at least 5 penalties and fit a distributional model to estimate their precision (sigma) in both dimensions z and y.
+
+We set up the model with random effects for both the location (mean aim point) and scale (precision) per taker.
+
+
+```{r}
+# Filter players with at least 5 penalties
+precision_data <- prepared_data %>%
+  group_by(taker) %>%
+  filter(n() >= 5) %>%
+  ungroup()
+
+print(paste("Number of penalties:", nrow(precision_data)))
+print(paste("Number of unique takers:", length(unique(precision_data$taker))))
+
+# Fit a distributional model (Location-Scale), with varying sigma by taker
+precision_fit <- brm(
+  bf(
+    # Location, the aiming point mu (with random intercept for takers)
+    mvbind(y_abs, z) ~ 1 + (1 |p| taker),
+    
+    # Scale: the consistency (with random intercept for taker)
+    sigma ~ 1 + (1 |p| taker)
+  ),
+  data = precision_data,
+  family = student(),
+  chains = 4,
+  iter = 2000,
+  seed = myseed,
+  file = "models/location_scale_model.rds"
+)
+```
+
+Lets print the degrees of freedom, is the student t distribution appropriate?
+
+```{r}
+summary(precision_fit)$spec_pars["nu",]
+```
+
+Lets plot the global precision estimates (fixed effects) for sigma_y and sigma_z
+for every taker
+
+```{r}
+# Fixed effect intercepts (Global Averages), on log scale
+global_log_sigma_y <- fixef(precision_fit)["sigma_yabs_Intercept", "Estimate"]
+global_log_sigma_z <- fixef(precision_fit)["sigma_z_Intercept", "Estimate"]
+
+p1 <- plot_sdcoef_meters(precision_fit, "sigma_yabs_Intercept", 
+  global_log_sigma_y, expression("Horizontal spread "* (sigma[y])))
+
+p2 <- plot_sdcoef_meters(precision_fit, "sigma_z_Intercept", 
+  global_log_sigma_z, expression("Vertical spread "* (sigma[z]))) 
+
+p1
+p2
+if (save_figs) {
+  ggsave("figures/taker_sigma_y.pdf", p1, width = 6, height = 4, device = quartz, type = "pdf")
+  ggsave("figures/taker_sigma_z.pdf", p2, width = 6, height = 4, device = quartz, type = "pdf")
+}
+```
+
+Lets also get the global estimate for rho: 
+the correlation between the horizontal and vertical errors
+
+```{r}
+#summary(precision_fit)
+
+post_summary <- posterior_summary(precision_fit)
+global_rho <- post_summary["rescor__yabs__z", "Estimate"]
+global_rho
+```
+
+Now we can get the taker precisions in meters, lets also rank them 
+by their consistency (sigma_y * sigma_z), where lower is more consistent
+
+```{r}
+# Random effects for takers
+r_effs <- ranef(precision_fit)$taker
+
+# Get the mean Estimate for the sigma intercepts
+player_deviations <- data.frame(
+  taker = rownames(r_effs),
+  dev_y = r_effs[, "Estimate", "sigma_yabs_Intercept"],
+  dev_z = r_effs[, "Estimate", "sigma_z_Intercept"]
+)
+rownames(player_deviations) <- NULL
+
+# Convert to meter units: Sigma = exp( Global + Deviation )
+player_stats <- player_deviations %>%
+  mutate(
+    sigma_y = exp(global_log_sigma_y + dev_y),
+    sigma_z = exp(global_log_sigma_z + dev_z),
+    # consistency score (lower means more consistent)
+    consistency_score = sigma_y * sigma_z 
+  ) %>%
+  arrange(consistency_score)
+
+print("Top 5 Most Consistent Players:")
+print(head(player_stats, 5))
+
+# print("Top 5 Least Consistent Players:")
+# print(tail(player_stats, 5))
+```
+
+# Plots of the spreads for the takers
+Plot the deviations for all players
+
+```{r}
+# get average sigmas (in meters)
+avg_sigma_y <- mean(player_stats$sigma_y)
+avg_sigma_z <- mean(player_stats$sigma_z)
+
+# find players with sz> 0.9 or sy > 0.9
+outlier_names <- player_stats %>%
+  filter(sigma_z > 0.9 | sigma_y > 0.9) %>%
+  mutate(taker = sapply(strsplit(as.character(taker), " "), function(x) tail(x, n=1))) 
+
+ggplot(player_stats, aes(x = sigma_y, y = sigma_z)) +
+  geom_point(alpha = 0.7, color = "blue") +
+  # add names for outliers
+  geom_text(data = outlier_names, aes(x = sigma_y, y = sigma_z, label = taker), 
+            vjust = -1, color = "black", size=3, nudge_x=-0.04, nudge_y=-0.03) +
+  geom_vline(xintercept = avg_sigma_y, linetype="dashed", color="black") +
+  geom_hline(yintercept = avg_sigma_z, linetype="dashed", color="black") +
+  geom_smooth(method = "lm", color = "red", linetype="dotted", alpha=0.2) +
+  labs(
+    title = "Taker's shooting spread",
+    x = expression("" * sigma[y] * " (m)"),
+    y = expression("" * sigma[z] * " (m)")
+  ) +
+  theme_bw()
+if (save_figs) {
+  ggsave("figures/taker_shooting_spread.pdf", width = 6, height = 4)
+}
+print(paste("Avg sigma_y and sigma_z:", round(avg_sigma_y,4), round(avg_sigma_z,4)))
+```
+
+
+
+# Risk probability assessment: Convolution
+
+```{r}
+# Lets first set rho 
+rho  <- round(global_rho, 3)  # from global_rho estimated above
+
+# vary sigma_y and z for three combinations
+comb <- data.frame(
+  sigma_y = c(0.5, round(avg_sigma_y,3), 1.0),
+  sigma_z = c(0.4, round(avg_sigma_z,3), 1.0)
+)
+
+for (i in 1:nrow(comb)) {
+  sigma_y <- comb$sigma_y[i]
+  sigma_z <- comb$sigma_z[i]
+  
+  plots <- plot_riskshot(prob_grid, sigma_y, sigma_z, rho)
+  
+  if (save_figs) {
+    ggsave(paste0("figures/sy_sz_study/sy", sigma_y,"sz", sigma_z,"r",rho,".pdf"), 
+        plots$surface, width = 8, height = 3.5)
+    ggsave(paste0("figures/sy_sz_study/comparison_sy", sigma_y,"sz", sigma_z,"r",rho,".pdf"), 
+        plots$comparison, width = 6, height = 3.5)
+  }
+}
+```
+
+
+```{r}
+rho_comb <- data.frame(
+  rho = c(-0.9, 0, 0.9)
+)
+
+for (i in 1:nrow(rho_comb)) {
+  rho <- round(rho_comb$rho[i],3)
+  
+  plots <- plot_riskshot(prob_grid, avg_sigma_y, avg_sigma_z, rho)
+  
+  if (save_figs) {
+    ggsave(paste0("figures/rho_study/avg_sysz_", rho,".pdf"), 
+        plots$surface, width = 8, height = 3.5)
+    ggsave(paste0("figures/rho_study/comparison_avg_sysz_", rho,".pdf"), 
+        plots$comparison, width = 6, height = 3.5)
+  }
+}
+```
