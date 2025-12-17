@@ -1,6 +1,10 @@
 # Ignore directories
-figures/
+# figures/
 models/
+
+# ignore all figures, except sy_sz_study/sy0.5sz0.4r-0.2.pdf
+figures/*
+!figures/sy0.5sz0.4r-0.2-1.png
 
 # Ignore DS_Store files
 **/.DS_Store
